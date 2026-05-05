@@ -27,24 +27,28 @@ app.use(express.json());
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id            SERIAL PRIMARY KEY,
-      username      VARCHAR(50)  UNIQUE NOT NULL,
-      email         VARCHAR(255) UNIQUE NOT NULL,
-      password_hash VARCHAR(255) NOT NULL,
-      created_at    TIMESTAMPTZ  DEFAULT NOW(),
-      avatar_char   VARCHAR(2)   DEFAULT '',
-      watchlist     JSONB        DEFAULT '[]',
-      watchlist_ids JSONB        DEFAULT '[]',
-      liked         JSONB        DEFAULT '[]',
-      liked_ids     JSONB        DEFAULT '[]',
-      ratings       JSONB        DEFAULT '{}',
-      settings      JSONB        DEFAULT '{}'
+      id                SERIAL PRIMARY KEY,
+      username          VARCHAR(50)  UNIQUE NOT NULL,
+      email             VARCHAR(255) UNIQUE NOT NULL,
+      password_hash     VARCHAR(255) NOT NULL,
+      created_at        TIMESTAMPTZ  DEFAULT NOW(),
+      avatar_char       VARCHAR(2)   DEFAULT '',
+      watchlist         JSONB        DEFAULT '[]',
+      watchlist_ids     JSONB        DEFAULT '[]',
+      liked             JSONB        DEFAULT '[]',
+      liked_ids         JSONB        DEFAULT '[]',
+      ratings           JSONB        DEFAULT '{}',
+      settings          JSONB        DEFAULT '{}'
     );
   `);
-  // Add reminders column if it doesn't exist yet (safe to run repeatedly)
+  // Add columns if they don't exist yet (safe to run repeatedly)
   await pool.query(`
     ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS reminders JSONB DEFAULT '{}';
+    ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';
+  `);
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';
   `);
   console.log("✓ DB ready");
 };
@@ -166,11 +170,12 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 });
 
 // ── GET /user/data ──────────────────────────────────────────────
-// Called on login to restore library + reminders on any device
+// Called on login to restore library, reminders, and watch history
 app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT watchlist_ids, watchlist, liked_ids, liked, reminders
+      `SELECT watchlist_ids, watchlist, liked_ids, liked,
+              reminders, continue_watching
        FROM users WHERE id = $1`,
       [req.userId]
     );
@@ -178,10 +183,11 @@ app.get("/user/data", authMiddleware, async (req, res) => {
 
     res.json({
       library: {
-        watchlist_ids:   rows[0].watchlist_ids || [],
-        watchlist_items: rows[0].watchlist     || [],
-        liked_ids:       rows[0].liked_ids     || [],
-        liked_items:     rows[0].liked         || [],
+        watchlist_ids:    rows[0].watchlist_ids  || [],
+        watchlist_items:  rows[0].watchlist      || [],
+        liked_ids:        rows[0].liked_ids      || [],
+        liked_items:      rows[0].liked          || [],
+        continue_watching: rows[0].continue_watching || {},
       },
       reminders: rows[0].reminders || {},
     });
@@ -192,28 +198,40 @@ app.get("/user/data", authMiddleware, async (req, res) => {
 });
 
 // ── PUT /user/sync ──────────────────────────────────────────────
-// Called automatically (debounced) whenever library or reminders change
+// Called automatically (debounced) whenever library, reminders, or watch history changes
 app.put("/user/sync", authMiddleware, async (req, res) => {
-  const { watchlist_ids, watchlist_items, liked_ids, liked_items, reminders, ratings, settings } = req.body ?? {};
+  const {
+    watchlist_ids,
+    watchlist_items,
+    liked_ids,
+    liked_items,
+    reminders,
+    ratings,
+    settings,
+    continue_watching,
+  } = req.body ?? {};
+
   try {
     await pool.query(
       `UPDATE users
-       SET watchlist_ids = COALESCE($1, watchlist_ids),
-           watchlist     = COALESCE($2, watchlist),
-           liked_ids     = COALESCE($3, liked_ids),
-           liked         = COALESCE($4, liked),
-           reminders     = COALESCE($5, reminders),
-           ratings       = COALESCE($6, ratings),
-           settings      = COALESCE($7, settings)
-       WHERE id = $8`,
+       SET watchlist_ids     = COALESCE($1,  watchlist_ids),
+           watchlist         = COALESCE($2,  watchlist),
+           liked_ids         = COALESCE($3,  liked_ids),
+           liked             = COALESCE($4,  liked),
+           reminders         = COALESCE($5,  reminders),
+           ratings           = COALESCE($6,  ratings),
+           settings          = COALESCE($7,  settings),
+           continue_watching = COALESCE($8,  continue_watching)
+       WHERE id = $9`,
       [
-        watchlist_ids   ? JSON.stringify(watchlist_ids)   : null,
-        watchlist_items ? JSON.stringify(watchlist_items) : null,
-        liked_ids       ? JSON.stringify(liked_ids)       : null,
-        liked_items     ? JSON.stringify(liked_items)     : null,
-        reminders       ? JSON.stringify(reminders)       : null,
-        ratings         ? JSON.stringify(ratings)         : null,
-        settings        ? JSON.stringify(settings)        : null,
+        watchlist_ids     ? JSON.stringify(watchlist_ids)     : null,
+        watchlist_items   ? JSON.stringify(watchlist_items)   : null,
+        liked_ids         ? JSON.stringify(liked_ids)         : null,
+        liked_items       ? JSON.stringify(liked_items)       : null,
+        reminders         ? JSON.stringify(reminders)         : null,
+        ratings           ? JSON.stringify(ratings)           : null,
+        settings          ? JSON.stringify(settings)          : null,
+        continue_watching ? JSON.stringify(continue_watching) : null,
         req.userId,
       ]
     );
