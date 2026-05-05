@@ -41,6 +41,11 @@ const initDB = async () => {
       settings      JSONB        DEFAULT '{}'
     );
   `);
+  // Add reminders column if it doesn't exist yet (safe to run repeatedly)
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS reminders JSONB DEFAULT '{}';
+  `);
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
@@ -160,23 +165,55 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
+// ── GET /user/data ──────────────────────────────────────────────
+// Called on login to restore library + reminders on any device
+app.get("/user/data", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT watchlist_ids, watchlist, liked_ids, liked, reminders
+       FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "User not found." });
+
+    res.json({
+      library: {
+        watchlist_ids:   rows[0].watchlist_ids || [],
+        watchlist_items: rows[0].watchlist     || [],
+        liked_ids:       rows[0].liked_ids     || [],
+        liked_items:     rows[0].liked         || [],
+      },
+      reminders: rows[0].reminders || {},
+    });
+  } catch (err) {
+    console.error("Data fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch user data." });
+  }
+});
+
 // ── PUT /user/sync ──────────────────────────────────────────────
-// Call this from the frontend to persist watchlist/liked/ratings
+// Called automatically (debounced) whenever library or reminders change
 app.put("/user/sync", authMiddleware, async (req, res) => {
-  const { watchlist_ids, liked_ids, ratings, settings } = req.body ?? {};
+  const { watchlist_ids, watchlist_items, liked_ids, liked_items, reminders, ratings, settings } = req.body ?? {};
   try {
     await pool.query(
       `UPDATE users
        SET watchlist_ids = COALESCE($1, watchlist_ids),
-           liked_ids     = COALESCE($2, liked_ids),
-           ratings       = COALESCE($3, ratings),
-           settings      = COALESCE($4, settings)
-       WHERE id = $5`,
+           watchlist     = COALESCE($2, watchlist),
+           liked_ids     = COALESCE($3, liked_ids),
+           liked         = COALESCE($4, liked),
+           reminders     = COALESCE($5, reminders),
+           ratings       = COALESCE($6, ratings),
+           settings      = COALESCE($7, settings)
+       WHERE id = $8`,
       [
-        watchlist_ids ? JSON.stringify(watchlist_ids) : null,
-        liked_ids     ? JSON.stringify(liked_ids)     : null,
-        ratings       ? JSON.stringify(ratings)       : null,
-        settings      ? JSON.stringify(settings)      : null,
+        watchlist_ids   ? JSON.stringify(watchlist_ids)   : null,
+        watchlist_items ? JSON.stringify(watchlist_items) : null,
+        liked_ids       ? JSON.stringify(liked_ids)       : null,
+        liked_items     ? JSON.stringify(liked_items)     : null,
+        reminders       ? JSON.stringify(reminders)       : null,
+        ratings         ? JSON.stringify(ratings)         : null,
+        settings        ? JSON.stringify(settings)        : null,
         req.userId,
       ]
     );
