@@ -185,11 +185,12 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
 </html>`,
     }),
   });
+  const body = await res.json();
+  console.log("Brevo verify response:", res.status, JSON.stringify(body));
   if (!res.ok) {
-    const err = await res.json();
-    throw new Error(JSON.stringify(err) || 'Brevo API error');
+    throw new Error(JSON.stringify(body) || 'Brevo API error');
   }
-  return res.json();
+  return body;
 };
 
 // ── JWT helpers ─────────────────────────────────────────────────
