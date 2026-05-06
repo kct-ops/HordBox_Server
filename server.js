@@ -1,20 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
 //  HordBox Railway Backend — server.js
-//  Stack: Node.js + Express + PostgreSQL + JWT + bcrypt + node-cron
+//  Stack: Node.js + Express + PostgreSQL + JWT + bcrypt
 //  Deploy to: railway.app (attach a PostgreSQL plugin)
-//
-//  Required env vars:
-//    DATABASE_URL    — Railway PostgreSQL connection string (auto-set)
-//    JWT_SECRET      — Secret for signing tokens
-//    TMDB_KEY        — Your TMDB API key (same one used in the frontend)
-//    ALLOWED_ORIGIN  — Your Vercel/Netlify frontend URL (optional, defaults to *)
 // ═══════════════════════════════════════════════════════════════
 
 const express  = require("express");
 const cors     = require("cors");
 const bcrypt   = require("bcryptjs");
 const jwt      = require("jsonwebtoken");
-const cron     = require("node-cron");
 const { Pool } = require("pg");
 
 const app  = express();
@@ -57,21 +50,11 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';
   `);
+  // ✅ NEW: search history column
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
   `);
-
-  // ── app_cache: global key/value store for shared backend data ──
-  // Used to cache the upcoming movie IDs list fetched from TMDB.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_cache (
-      key        VARCHAR(100) PRIMARY KEY,
-      value      JSONB        NOT NULL,
-      updated_at TIMESTAMPTZ  DEFAULT NOW()
-    );
-  `);
-
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
@@ -93,108 +76,10 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// ── UPCOMING IDS — TMDB fetch + cache ──────────────────────────
-// Fetches all upcoming US movie IDs from TMDB (pages 1–5, ~100 movies),
-// filters to only future release dates, dedupes, and saves to app_cache.
-// Called on server startup and then every day at 03:00 UTC via cron.
-const refreshUpcomingIds = async () => {
-  const TMDB_KEY = process.env.TMDB_KEY;
-  if (!TMDB_KEY) {
-    console.warn("⚠  TMDB_KEY not set — skipping upcoming IDs refresh");
-    return null;
-  }
-
-  try {
-    const today  = new Date().toISOString().split("T")[0];
-    let   allIds = [];
-
-    for (let page = 1; page <= 5; page++) {
-      const url = new URL("https://api.themoviedb.org/3/movie/upcoming");
-      url.searchParams.set("api_key", TMDB_KEY);
-      url.searchParams.set("region",  "US");
-      url.searchParams.set("page",    page);
-
-      const res  = await fetch(url.toString());
-      if (!res.ok) break;
-
-      const data = await res.json();
-      const ids  = (data.results || [])
-        .filter(m => m.release_date && m.release_date > today)
-        .map(m => m.id);
-
-      allIds = [...allIds, ...ids];
-
-      // Don't paginate past what TMDB has
-      if (page >= (data.total_pages || 1)) break;
-    }
-
-    const unique = [...new Set(allIds)];
-
-    await pool.query(
-      `INSERT INTO app_cache (key, value, updated_at)
-       VALUES ('upcoming_ids', $1, NOW())
-       ON CONFLICT (key) DO UPDATE
-         SET value      = $1,
-             updated_at = NOW()`,
-      [JSON.stringify(unique)]
-    );
-
-    console.log(`✓ upcoming_ids refreshed — ${unique.length} IDs`);
-    return unique;
-  } catch (err) {
-    console.error("upcoming_ids refresh failed:", err);
-    return null;
-  }
-};
-
-// Run once at startup (after DB is ready), then daily at 03:00 UTC
-initDB()
-  .then(() => refreshUpcomingIds())
-  .catch(console.error);
-
-cron.schedule("0 3 * * *", () => {
-  console.log("⏰ Cron: refreshing upcoming IDs…");
-  refreshUpcomingIds();
-});
-
 // ── ROUTES ─────────────────────────────────────────────────────
 
 // Health check
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
-
-// ── GET /upcoming-ids ───────────────────────────────────────────
-// Public — no auth needed. Returns the cached upcoming movie ID list.
-// If the cache is empty (first cold boot before cron fires) it triggers
-// a live fetch so the response is never empty on a fresh deploy.
-app.get("/upcoming-ids", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT value, updated_at FROM app_cache WHERE key = 'upcoming_ids'"
-    );
-
-    if (!rows[0]) {
-      // Cache miss — fetch now and return the result directly
-      const ids = await refreshUpcomingIds();
-      return res.json({ ids: ids || [], updated_at: new Date() });
-    }
-
-    res.json({ ids: rows[0].value, updated_at: rows[0].updated_at });
-  } catch (err) {
-    console.error("upcoming-ids fetch error:", err);
-    res.status(500).json({ error: "Could not fetch upcoming IDs." });
-  }
-});
-
-// ── POST /upcoming-ids/refresh ──────────────────────────────────
-// Protected — requires a valid user JWT. Lets you manually trigger a
-// refresh from a dashboard or curl without waiting for the daily cron.
-// Example: curl -X POST https://your-api.railway.app/upcoming-ids/refresh \
-//               -H "Authorization: Bearer <your_token>"
-app.post("/upcoming-ids/refresh", authMiddleware, async (req, res) => {
-  const ids = await refreshUpcomingIds();
-  if (!ids) return res.status(500).json({ error: "Refresh failed. Check TMDB_KEY." });
-  res.json({ success: true, count: ids.length });
-});
 
 // ── POST /auth/register ─────────────────────────────────────────
 app.post("/auth/register", async (req, res) => {
@@ -294,6 +179,7 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
+      // ✅ CHANGED: added search_history to SELECT
       `SELECT watchlist_ids, watchlist, liked_ids, liked,
               reminders, continue_watching, settings, search_history
        FROM users WHERE id = $1`,
@@ -311,7 +197,7 @@ app.get("/user/data", authMiddleware, async (req, res) => {
       },
       reminders:      rows[0].reminders      || {},
       settings:       rows[0].settings       || {},
-      search_history: rows[0].search_history || [],
+      search_history: rows[0].search_history || [],  // ✅ NEW
     });
   } catch (err) {
     console.error("Data fetch error:", err);
@@ -331,11 +217,12 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
     ratings,
     settings,
     continue_watching,
-    search_history,
+    search_history,   // ✅ NEW
   } = req.body ?? {};
 
   try {
     await pool.query(
+      // ✅ CHANGED: added search_history to SET, shifted WHERE id to $10
       `UPDATE users
        SET watchlist_ids     = COALESCE($1,  watchlist_ids),
            watchlist         = COALESCE($2,  watchlist),
@@ -356,7 +243,7 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
         ratings           ? JSON.stringify(ratings)           : null,
         settings          ? JSON.stringify(settings)          : null,
         continue_watching ? JSON.stringify(continue_watching) : null,
-        search_history    ? JSON.stringify(search_history)    : null,
+        search_history    ? JSON.stringify(search_history)    : null, // ✅ NEW
         req.userId,
       ]
     );
