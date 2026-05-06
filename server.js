@@ -8,7 +8,7 @@ const express    = require("express");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
-const crypto     = require("crypto");
+const crypto     = require("crypto");           // built-in
 const { Pool }   = require("pg");
 
 const app  = express();
@@ -19,12 +19,12 @@ const pool = new Pool({
 
 // ── Middleware ──────────────────────────────────────────────────
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || "*",
+  origin: process.env.ALLOWED_ORIGIN || "*",   // set your Vercel/Netlify URL
   credentials: true,
 }));
 app.use(express.json());
 
-// ── DB Init ─────────────────────────────────────────────────────
+// ── DB Init — run once on startup ──────────────────────────────
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -42,11 +42,21 @@ const initDB = async () => {
       settings          JSONB        DEFAULT '{}'
     );
   `);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN     DEFAULT FALSE;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token  VARCHAR(64) DEFAULT NULL;`);
+  // Add columns if they don't exist yet (safe to run repeatedly)
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';
+  `);
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';
+  `);
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
+  `);
+
+  // ── Password reset tokens table ─────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id         SERIAL PRIMARY KEY,
@@ -57,11 +67,12 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
 
-// ── Send password-reset email via Resend ────────────────────────
+// Send email via Resend HTTP API (avoids Railway SMTP port blocks)
 const sendResetEmail = async (to, username, resetUrl) => {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -70,7 +81,7 @@ const sendResetEmail = async (to, username, resetUrl) => {
       'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
     },
     body: JSON.stringify({
-      from: 'HordBox <onboarding@resend.dev>',
+      from: process.env.SMTP_FROM || 'HordBox <onboarding@resend.dev>',
       to: [to],
       subject: 'Reset your HordBox password',
       html: `<!DOCTYPE html>
@@ -112,66 +123,11 @@ const sendResetEmail = async (to, username, resetUrl) => {
 </html>`,
     }),
   });
-  const body = await res.json();
-  console.log("Resend reset response:", res.status, JSON.stringify(body));
-  if (!res.ok) throw new Error(JSON.stringify(body));
-  return body;
-};
-
-// ── Send verification email via Resend ──────────────────────────
-const sendVerificationEmail = async (to, username, verifyUrl) => {
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-    },
-    body: JSON.stringify({
-      from: 'HordBox <onboarding@resend.dev>',
-      to: [to],
-      subject: 'Verify your HordBox email',
-      html: `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#07090e;padding:40px 0;">
-    <tr><td align="center">
-      <table width="480" cellpadding="0" cellspacing="0"
-        style="background:#0d1119;border:1px solid #1e2736;border-radius:16px;padding:40px 36px;">
-        <tr><td>
-          <div style="font-size:22px;font-weight:900;color:#00c2d4;letter-spacing:2px;margin-bottom:28px;">
-            HORD<span style="color:#eef2f8;">BOX</span>
-          </div>
-          <h2 style="color:#eef2f8;font-size:20px;font-weight:800;margin:0 0 10px;">
-            Confirm your email
-          </h2>
-          <p style="color:#8ca0b8;font-size:14px;line-height:1.6;margin:0 0 24px;">
-            Hi ${username}, thanks for joining HordBox!
-            Click below to verify your email address and activate your account.
-          </p>
-          <a href="${verifyUrl}"
-            style="display:inline-block;background:#00c2d4;color:#07090e;font-weight:800;
-                   font-size:15px;padding:14px 32px;border-radius:10px;text-decoration:none;
-                   letter-spacing:0.3px;margin-bottom:24px;">
-            Verify Email
-          </a>
-          <p style="color:#4a5a6e;font-size:12px;line-height:1.6;margin:0;">
-            If you didn't create an account, you can safely ignore this email.<br><br>
-            Or copy this link into your browser:<br>
-            <span style="color:#00c2d4;word-break:break-all;">${verifyUrl}</span>
-          </p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`,
-    }),
-  });
-  const body = await res.json();
-  console.log("Resend verify response:", res.status, JSON.stringify(body));
-  if (!res.ok) throw new Error(JSON.stringify(body));
-  return body;
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || 'Resend API error');
+  }
+  return res.json();
 };
 
 // ── JWT helpers ─────────────────────────────────────────────────
@@ -191,40 +147,43 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// ── ROUTES ──────────────────────────────────────────────────────
+// ── ROUTES ─────────────────────────────────────────────────────
 
+// Health check
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
+// ── POST /auth/register ─────────────────────────────────────────
 app.post("/auth/register", async (req, res) => {
   const { username, email, password } = req.body ?? {};
 
   if (!username?.trim() || !email?.trim() || !password)
     return res.status(400).json({ error: "username, email and password are required." });
+
   if (username.trim().length < 3)
     return res.status(400).json({ error: "Username must be at least 3 characters." });
+
   if (password.length < 8)
     return res.status(400).json({ error: "Password must be at least 8 characters." });
+
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: "Please enter a valid email address." });
 
   try {
-    const hash  = await bcrypt.hash(password, 12);
-    const token = crypto.randomBytes(32).toString("hex");
-
+    const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, avatar_char, verification_token, email_verified)
-       VALUES ($1, $2, $3, $4, $5, FALSE)
-       RETURNING id, username, email`,
-      [username.trim(), email.toLowerCase().trim(), hash, username.trim()[0].toUpperCase(), token]
+      `INSERT INTO users (username, email, password_hash, avatar_char)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, username, email, created_at`,
+      [
+        username.trim(),
+        email.toLowerCase().trim(),
+        hash,
+        username.trim()[0].toUpperCase(),
+      ]
     );
 
-    const appUrl    = process.env.APP_URL || "https://hordbox.vercel.app";
-    const verifyUrl = `${appUrl}?verify_token=${token}`;
-    sendVerificationEmail(email.trim(), username.trim(), verifyUrl)
-      .then(() => console.log(`✓ Verification email sent to ${email.trim()}`))
-      .catch((err) => console.error("✗ Verification email FAILED:", err.message));
-
-    res.status(201).json({ pending: true, email: rows[0].email });
+    const token = signToken(rows[0].id);
+    res.status(201).json({ token, user: rows[0] });
 
   } catch (err) {
     if (err.code === "23505") {
@@ -240,6 +199,7 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
+// ── POST /auth/login ────────────────────────────────────────────
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body ?? {};
 
@@ -259,14 +219,6 @@ app.post("/auth/login", async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Invalid email or password." });
 
-    if (!rows[0].email_verified) {
-      return res.status(403).json({
-        error: "Please verify your email before logging in.",
-        unverified: true,
-        email: rows[0].email,
-      });
-    }
-
     const { password_hash, ...user } = rows[0];
     const token = signToken(user.id);
     res.json({ token, user });
@@ -277,6 +229,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+// ── GET /auth/me ────────────────────────────────────────────────
 app.get("/auth/me", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -292,7 +245,11 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
+// ── POST /auth/forgot-password ──────────────────────────────────
+// Always returns 200 (prevents email enumeration).
+// Sends a reset link to the address if it exists in the DB.
 app.post("/auth/forgot-password", async (req, res) => {
+  // Respond immediately so the frontend never waits on SMTP
   res.json({ success: true });
 
   const { email } = req.body ?? {};
@@ -303,35 +260,42 @@ app.post("/auth/forgot-password", async (req, res) => {
       "SELECT id, username FROM users WHERE email = $1",
       [email.toLowerCase().trim()]
     );
-    if (!rows[0]) return;
+    if (!rows[0]) return; // silently do nothing — user not found
 
     const token   = crypto.randomBytes(32).toString("hex");
-    const expires = new Date(Date.now() + 60 * 60 * 1000);
+    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
+    // Invalidate any previous unused tokens for this user
     await pool.query(
       "UPDATE password_reset_tokens SET used = TRUE WHERE user_id = $1 AND used = FALSE",
       [rows[0].id]
     );
+
     await pool.query(
-      `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)`,
+      `INSERT INTO password_reset_tokens (user_id, token, expires_at)
+       VALUES ($1, $2, $3)`,
       [rows[0].id, token, expires]
     );
 
     const appUrl   = process.env.APP_URL || "https://hordbox.vercel.app";
     const resetUrl = `${appUrl}?reset_token=${token}`;
+    const username = rows[0].username;
 
-    await sendResetEmail(email.trim(), rows[0].username, resetUrl);
+    await sendResetEmail(email.trim(), username, resetUrl);
+
     console.log(`✓ Password reset email sent to ${email.trim()}`);
   } catch (err) {
     console.error("Forgot password error:", err);
   }
 });
 
+// ── POST /auth/reset-password ───────────────────────────────────
 app.post("/auth/reset-password", async (req, res) => {
   const { token, password } = req.body ?? {};
 
   if (!token || !password)
     return res.status(400).json({ error: "Token and new password are required." });
+
   if (password.length < 8)
     return res.status(400).json({ error: "Password must be at least 8 characters." });
 
@@ -346,8 +310,15 @@ app.post("/auth/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Reset link is invalid or has expired. Please request a new one." });
 
     const hash = await bcrypt.hash(password, 12);
-    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [hash, rows[0].user_id]);
-    await pool.query("UPDATE password_reset_tokens SET used = TRUE WHERE id = $1", [rows[0].id]);
+
+    await pool.query(
+      "UPDATE users SET password_hash = $1 WHERE id = $2",
+      [hash, rows[0].user_id]
+    );
+    await pool.query(
+      "UPDATE password_reset_tokens SET used = TRUE WHERE id = $1",
+      [rows[0].id]
+    );
 
     res.json({ success: true });
   } catch (err) {
@@ -356,6 +327,7 @@ app.post("/auth/reset-password", async (req, res) => {
   }
 });
 
+// ── GET /user/data ──────────────────────────────────────────────
 app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -384,10 +356,18 @@ app.get("/user/data", authMiddleware, async (req, res) => {
   }
 });
 
+// ── PUT /user/sync ──────────────────────────────────────────────
 app.put("/user/sync", authMiddleware, async (req, res) => {
   const {
-    watchlist_ids, watchlist_items, liked_ids, liked_items,
-    reminders, ratings, settings, continue_watching, search_history,
+    watchlist_ids,
+    watchlist_items,
+    liked_ids,
+    liked_items,
+    reminders,
+    ratings,
+    settings,
+    continue_watching,
+    search_history,
   } = req.body ?? {};
 
   try {
@@ -423,56 +403,7 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
   }
 });
 
-app.get("/auth/verify-email", async (req, res) => {
-  const { token } = req.query;
-  if (!token) return res.status(400).json({ error: "Token missing." });
-
-  try {
-    const { rows } = await pool.query(
-      `UPDATE users
-       SET email_verified = TRUE, verification_token = NULL
-       WHERE verification_token = $1 AND email_verified = FALSE
-       RETURNING id, username, email, created_at, avatar_char,
-                 watchlist_ids, liked_ids, ratings, settings`,
-      [token]
-    );
-
-    if (!rows[0])
-      return res.status(400).json({ error: "This link is invalid or already used." });
-
-    const jwt_token = signToken(rows[0].id);
-    res.json({ token: jwt_token, user: rows[0] });
-
-  } catch (err) {
-    console.error("Verify email error:", err);
-    res.status(500).json({ error: "Something went wrong." });
-  }
-});
-
-app.post("/auth/resend-verification", async (req, res) => {
-  const { email } = req.body ?? {};
-  res.json({ success: true });
-
-  if (!email?.trim()) return;
-
-  try {
-    const newToken = crypto.randomBytes(32).toString("hex");
-    const { rows } = await pool.query(
-      `UPDATE users SET verification_token = $1
-       WHERE email = $2 AND email_verified = FALSE
-       RETURNING username`,
-      [newToken, email.toLowerCase().trim()]
-    );
-    if (!rows[0]) return;
-
-    const appUrl    = process.env.APP_URL || "https://hordbox.vercel.app";
-    const verifyUrl = `${appUrl}?verify_token=${newToken}`;
-    await sendVerificationEmail(email.trim(), rows[0].username, verifyUrl);
-  } catch (err) {
-    console.error("Resend verification error:", err);
-  }
-});
-
+// ── DELETE /auth/account ────────────────────────────────────────
 app.delete("/auth/account", authMiddleware, async (req, res) => {
   try {
     await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
