@@ -50,6 +50,11 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';
   `);
+  // ✅ NEW: search history column
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
+  `);
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
@@ -174,8 +179,9 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
+      // ✅ CHANGED: added search_history to SELECT
       `SELECT watchlist_ids, watchlist, liked_ids, liked,
-              reminders, continue_watching, settings
+              reminders, continue_watching, settings, search_history
        FROM users WHERE id = $1`,
       [req.userId]
     );
@@ -183,14 +189,15 @@ app.get("/user/data", authMiddleware, async (req, res) => {
 
     res.json({
       library: {
-        watchlist_ids:    rows[0].watchlist_ids  || [],
-        watchlist_items:  rows[0].watchlist      || [],
-        liked_ids:        rows[0].liked_ids      || [],
-        liked_items:      rows[0].liked          || [],
-        continue_watching: rows[0].continue_watching || {},
+        watchlist_ids:     rows[0].watchlist_ids      || [],
+        watchlist_items:   rows[0].watchlist          || [],
+        liked_ids:         rows[0].liked_ids          || [],
+        liked_items:       rows[0].liked              || [],
+        continue_watching: rows[0].continue_watching  || {},
       },
-      reminders: rows[0].reminders || {},
-      settings:  rows[0].settings  || {},
+      reminders:      rows[0].reminders      || {},
+      settings:       rows[0].settings       || {},
+      search_history: rows[0].search_history || [],  // ✅ NEW
     });
   } catch (err) {
     console.error("Data fetch error:", err);
@@ -210,10 +217,12 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
     ratings,
     settings,
     continue_watching,
+    search_history,   // ✅ NEW
   } = req.body ?? {};
 
   try {
     await pool.query(
+      // ✅ CHANGED: added search_history to SET, shifted WHERE id to $10
       `UPDATE users
        SET watchlist_ids     = COALESCE($1,  watchlist_ids),
            watchlist         = COALESCE($2,  watchlist),
@@ -222,8 +231,9 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
            reminders         = COALESCE($5,  reminders),
            ratings           = COALESCE($6,  ratings),
            settings          = COALESCE($7,  settings),
-           continue_watching = COALESCE($8,  continue_watching)
-       WHERE id = $9`,
+           continue_watching = COALESCE($8,  continue_watching),
+           search_history    = COALESCE($9,  search_history)
+       WHERE id = $10`,
       [
         watchlist_ids     ? JSON.stringify(watchlist_ids)     : null,
         watchlist_items   ? JSON.stringify(watchlist_items)   : null,
@@ -233,6 +243,7 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
         ratings           ? JSON.stringify(ratings)           : null,
         settings          ? JSON.stringify(settings)          : null,
         continue_watching ? JSON.stringify(continue_watching) : null,
+        search_history    ? JSON.stringify(search_history)    : null, // ✅ NEW
         req.userId,
       ]
     );
