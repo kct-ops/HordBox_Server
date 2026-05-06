@@ -42,7 +42,6 @@ const initDB = async () => {
       settings          JSONB        DEFAULT '{}'
     );
   `);
-  // Add columns if they don't exist yet (safe to run repeatedly)
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';
@@ -55,8 +54,6 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
   `);
-
-  // ── Change 1: email verification columns ───────────────────
   await pool.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN     DEFAULT FALSE;
@@ -65,8 +62,6 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS verification_token  VARCHAR(64) DEFAULT NULL;
   `);
-
-  // ── Password reset tokens table ─────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id         SERIAL PRIMARY KEY,
@@ -91,7 +86,7 @@ const sendResetEmail = async (to, username, resetUrl) => {
       'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: 'noreply@hordbox.com' },
+      sender: { name: 'HordBox', email: process.env.BREVO_SENDER_EMAIL },
       to: [{ email: to }],
       subject: 'Reset your HordBox password',
       htmlContent: `<!DOCTYPE html>
@@ -135,7 +130,7 @@ const sendResetEmail = async (to, username, resetUrl) => {
   });
   if (!res.ok) {
     const err = await res.json();
-    throw new Error(err.message || 'Brevo API error');
+    throw new Error(JSON.stringify(err) || 'Brevo API error');
   }
   return res.json();
 };
@@ -149,7 +144,7 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
       'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: 'noreply@hordbox.com' },
+      sender: { name: 'HordBox', email: process.env.BREVO_SENDER_EMAIL },
       to: [{ email: to }],
       subject: 'Verify your HordBox email',
       htmlContent: `<!DOCTYPE html>
@@ -192,7 +187,7 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
   });
   if (!res.ok) {
     const err = await res.json();
-    throw new Error(err.message || 'Brevo API error');
+    throw new Error(JSON.stringify(err) || 'Brevo API error');
   }
   return res.json();
 };
@@ -216,10 +211,8 @@ const authMiddleware = (req, res, next) => {
 
 // ── ROUTES ─────────────────────────────────────────────────────
 
-// Health check
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
-// ── POST /auth/register — sends verification email ──────────────
 app.post("/auth/register", async (req, res) => {
   const { username, email, password } = req.body ?? {};
 
@@ -243,12 +236,10 @@ app.post("/auth/register", async (req, res) => {
       [username.trim(), email.toLowerCase().trim(), hash, username.trim()[0].toUpperCase(), token]
     );
 
-    // Send verification email (fire & forget — don't block response)
     const appUrl    = process.env.APP_URL || "https://hordbox.vercel.app";
     const verifyUrl = `${appUrl}?verify_token=${token}`;
     sendVerificationEmail(email.trim(), username.trim(), verifyUrl).catch(console.error);
 
-    // Return pending — NO jwt token yet
     res.status(201).json({ pending: true, email: rows[0].email });
 
   } catch (err) {
@@ -265,7 +256,6 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-// ── POST /auth/login ────────────────────────────────────────────
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body ?? {};
 
@@ -285,7 +275,6 @@ app.post("/auth/login", async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Invalid email or password." });
 
-    // Block unverified users
     if (!rows[0].email_verified) {
       return res.status(403).json({
         error: "Please verify your email before logging in.",
@@ -304,7 +293,6 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// ── GET /auth/me ────────────────────────────────────────────────
 app.get("/auth/me", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -320,8 +308,6 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
-// ── POST /auth/forgot-password ──────────────────────────────────
-// Always returns 200 (prevents email enumeration).
 app.post("/auth/forgot-password", async (req, res) => {
   res.json({ success: true });
 
@@ -336,16 +322,14 @@ app.post("/auth/forgot-password", async (req, res) => {
     if (!rows[0]) return;
 
     const token   = crypto.randomBytes(32).toString("hex");
-    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const expires = new Date(Date.now() + 60 * 60 * 1000);
 
     await pool.query(
       "UPDATE password_reset_tokens SET used = TRUE WHERE user_id = $1 AND used = FALSE",
       [rows[0].id]
     );
-
     await pool.query(
-      `INSERT INTO password_reset_tokens (user_id, token, expires_at)
-       VALUES ($1, $2, $3)`,
+      `INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)`,
       [rows[0].id, token, expires]
     );
 
@@ -359,13 +343,11 @@ app.post("/auth/forgot-password", async (req, res) => {
   }
 });
 
-// ── POST /auth/reset-password ───────────────────────────────────
 app.post("/auth/reset-password", async (req, res) => {
   const { token, password } = req.body ?? {};
 
   if (!token || !password)
     return res.status(400).json({ error: "Token and new password are required." });
-
   if (password.length < 8)
     return res.status(400).json({ error: "Password must be at least 8 characters." });
 
@@ -380,15 +362,8 @@ app.post("/auth/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Reset link is invalid or has expired. Please request a new one." });
 
     const hash = await bcrypt.hash(password, 12);
-
-    await pool.query(
-      "UPDATE users SET password_hash = $1 WHERE id = $2",
-      [hash, rows[0].user_id]
-    );
-    await pool.query(
-      "UPDATE password_reset_tokens SET used = TRUE WHERE id = $1",
-      [rows[0].id]
-    );
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [hash, rows[0].user_id]);
+    await pool.query("UPDATE password_reset_tokens SET used = TRUE WHERE id = $1", [rows[0].id]);
 
     res.json({ success: true });
   } catch (err) {
@@ -397,7 +372,6 @@ app.post("/auth/reset-password", async (req, res) => {
   }
 });
 
-// ── GET /user/data ──────────────────────────────────────────────
 app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -426,18 +400,10 @@ app.get("/user/data", authMiddleware, async (req, res) => {
   }
 });
 
-// ── PUT /user/sync ──────────────────────────────────────────────
 app.put("/user/sync", authMiddleware, async (req, res) => {
   const {
-    watchlist_ids,
-    watchlist_items,
-    liked_ids,
-    liked_items,
-    reminders,
-    ratings,
-    settings,
-    continue_watching,
-    search_history,
+    watchlist_ids, watchlist_items, liked_ids, liked_items,
+    reminders, ratings, settings, continue_watching, search_history,
   } = req.body ?? {};
 
   try {
@@ -473,7 +439,6 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
   }
 });
 
-// ── GET /auth/verify-email?token=xxx ───────────────────────────
 app.get("/auth/verify-email", async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ error: "Token missing." });
@@ -500,10 +465,9 @@ app.get("/auth/verify-email", async (req, res) => {
   }
 });
 
-// ── POST /auth/resend-verification ─────────────────────────────
 app.post("/auth/resend-verification", async (req, res) => {
   const { email } = req.body ?? {};
-  res.json({ success: true }); // always respond immediately
+  res.json({ success: true });
 
   if (!email?.trim()) return;
 
@@ -525,7 +489,6 @@ app.post("/auth/resend-verification", async (req, res) => {
   }
 });
 
-// ── DELETE /auth/account ────────────────────────────────────────
 app.delete("/auth/account", authMiddleware, async (req, res) => {
   try {
     await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
