@@ -82,19 +82,19 @@ const initDB = async () => {
 };
 initDB().catch(console.error);
 
-// Send password-reset email via Resend HTTP API
+// ── Send password-reset email via Brevo ─────────────────────────
 const sendResetEmail = async (to, username, resetUrl) => {
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      from: process.env.SMTP_FROM || 'HordBox <onboarding@resend.dev>',
-      to: [to],
+      sender: { name: 'HordBox', email: 'noreply@hordbox.com' },
+      to: [{ email: to }],
       subject: 'Reset your HordBox password',
-      html: `<!DOCTYPE html>
+      htmlContent: `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -135,24 +135,24 @@ const sendResetEmail = async (to, username, resetUrl) => {
   });
   if (!res.ok) {
     const err = await res.json();
-    throw new Error(err.message || 'Resend API error');
+    throw new Error(err.message || 'Brevo API error');
   }
   return res.json();
 };
 
-// ── Change 2: Send verification email via Resend ────────────────
+// ── Send verification email via Brevo ───────────────────────────
 const sendVerificationEmail = async (to, username, verifyUrl) => {
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      from: process.env.SMTP_FROM || 'HordBox <onboarding@resend.dev>',
-      to: [to],
+      sender: { name: 'HordBox', email: 'noreply@hordbox.com' },
+      to: [{ email: to }],
       subject: 'Verify your HordBox email',
-      html: `<!DOCTYPE html>
+      htmlContent: `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -192,7 +192,7 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
   });
   if (!res.ok) {
     const err = await res.json();
-    throw new Error(err.message || 'Resend API error');
+    throw new Error(err.message || 'Brevo API error');
   }
   return res.json();
 };
@@ -219,7 +219,7 @@ const authMiddleware = (req, res, next) => {
 // Health check
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
-// ── Change 3: POST /auth/register — sends verification email ────
+// ── POST /auth/register — sends verification email ──────────────
 app.post("/auth/register", async (req, res) => {
   const { username, email, password } = req.body ?? {};
 
@@ -285,7 +285,7 @@ app.post("/auth/login", async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Invalid email or password." });
 
-    // ── Change 5: block unverified users ──────────────────────
+    // Block unverified users
     if (!rows[0].email_verified) {
       return res.status(403).json({
         error: "Please verify your email before logging in.",
@@ -473,7 +473,7 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
   }
 });
 
-// ── Change 4a: GET /auth/verify-email?token=xxx ─────────────────
+// ── GET /auth/verify-email?token=xxx ───────────────────────────
 app.get("/auth/verify-email", async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ error: "Token missing." });
@@ -500,7 +500,7 @@ app.get("/auth/verify-email", async (req, res) => {
   }
 });
 
-// ── Change 4b: POST /auth/resend-verification ───────────────────
+// ── POST /auth/resend-verification ─────────────────────────────
 app.post("/auth/resend-verification", async (req, res) => {
   const { email } = req.body ?? {};
   res.json({ success: true }); // always respond immediately
