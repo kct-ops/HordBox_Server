@@ -86,7 +86,7 @@ const sendResetEmail = async (to, username, resetUrl) => {
       'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: process.env.BREVO_SENDER_EMAIL },
+      sender: { name: 'HordBox', email: 'kctrical@gmail.com' },
       to: [{ email: to }],
       subject: 'Reset your HordBox password',
       htmlContent: `<!DOCTYPE html>
@@ -144,7 +144,7 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
       'api-key': process.env.BREVO_API_KEY,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: process.env.BREVO_SENDER_EMAIL },
+      sender: { name: 'HordBox', email: 'kctrical@gmail.com' },
       to: [{ email: to }],
       subject: 'Verify your HordBox email',
       htmlContent: `<!DOCTYPE html>
@@ -238,7 +238,9 @@ app.post("/auth/register", async (req, res) => {
 
     const appUrl    = process.env.APP_URL || "https://hordbox.vercel.app";
     const verifyUrl = `${appUrl}?verify_token=${token}`;
-    sendVerificationEmail(email.trim(), username.trim(), verifyUrl).catch(console.error);
+    sendVerificationEmail(email.trim(), username.trim(), verifyUrl)
+      .then(() => console.log(`✓ Verification email sent to ${email.trim()}`))
+      .catch((err) => console.error("✗ Verification email FAILED:", err.message));
 
     res.status(201).json({ pending: true, email: rows[0].email });
 
