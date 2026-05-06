@@ -54,6 +54,14 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
   `);
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS security_question VARCHAR(255) DEFAULT '';
+  `);
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS security_answer_hash VARCHAR(255) DEFAULT '';
+  `);
 
   console.log("✓ DB ready");
 };
@@ -83,7 +91,7 @@ app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
 // ── POST /auth/register ─────────────────────────────────────────
 app.post("/auth/register", async (req, res) => {
-  const { username, email, password } = req.body ?? {};
+  const { username, email, password, security_question, security_answer } = req.body ?? {};
 
   if (!username?.trim() || !email?.trim() || !password)
     return res.status(400).json({ error: "username, email and password are required." });
@@ -97,17 +105,26 @@ app.post("/auth/register", async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: "Please enter a valid email address." });
 
+  if (!security_question?.trim() || !security_answer?.trim())
+    return res.status(400).json({ error: "Please choose a security question and provide an answer." });
+
+  if (security_answer.trim().length < 2)
+    return res.status(400).json({ error: "Security answer must be at least 2 characters." });
+
   try {
-    const hash = await bcrypt.hash(password, 12);
+    const hash       = await bcrypt.hash(password, 12);
+    const answerHash = await bcrypt.hash(security_answer.trim().toLowerCase(), 12);
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, avatar_char)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO users (username, email, password_hash, avatar_char, security_question, security_answer_hash)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, username, email, created_at`,
       [
         username.trim(),
         email.toLowerCase().trim(),
         hash,
         username.trim()[0].toUpperCase(),
+        security_question.trim(),
+        answerHash,
       ]
     );
 
@@ -171,6 +188,67 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
     res.json(rows[0]);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch user." });
+  }
+});
+
+// ── POST /auth/get-security-question ────────────────────────────
+// Takes an email, returns the security question for that account.
+app.post("/auth/get-security-question", async (req, res) => {
+  const { email } = req.body ?? {};
+  if (!email?.trim())
+    return res.status(400).json({ error: "Email is required." });
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT security_question FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
+    );
+    if (!rows[0] || !rows[0].security_question)
+      return res.status(404).json({ error: "No account found with that email address." });
+
+    res.json({ question: rows[0].security_question });
+  } catch (err) {
+    console.error("Get security question error:", err);
+    res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+// ── POST /auth/reset-password ────────────────────────────────────
+// Takes email + security answer + new password. No token needed.
+app.post("/auth/reset-password", async (req, res) => {
+  const { email, security_answer, new_password } = req.body ?? {};
+
+  if (!email?.trim() || !security_answer?.trim() || !new_password)
+    return res.status(400).json({ error: "Email, security answer, and new password are required." });
+
+  if (new_password.length < 8)
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, security_answer_hash FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
+    );
+    if (!rows[0])
+      return res.status(404).json({ error: "No account found with that email address." });
+
+    const valid = await bcrypt.compare(
+      security_answer.trim().toLowerCase(),
+      rows[0].security_answer_hash
+    );
+    if (!valid)
+      return res.status(401).json({ error: "Incorrect answer. Please try again." });
+
+    const hash = await bcrypt.hash(new_password, 12);
+    await pool.query(
+      "UPDATE users SET password_hash = $1 WHERE id = $2",
+      [hash, rows[0].id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Reset password error:", err);
+    res.status(500).json({ error: "Something went wrong. Please try again." });
   }
 });
 
