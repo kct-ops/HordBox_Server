@@ -8,7 +8,6 @@ const express  = require("express");
 const cors     = require("cors");
 const bcrypt   = require("bcryptjs");
 const jwt      = require("jsonwebtoken");
-const cron     = require("node-cron"); // ✅ NEW: npm install node-cron
 const { Pool } = require("pg");
 
 const app  = express();
@@ -56,14 +55,6 @@ const initDB = async () => {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
   `);
-  // ✅ NEW: global app cache table (stores upcoming movie IDs, refreshed daily)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_cache (
-      key        VARCHAR(100) PRIMARY KEY,
-      value      JSONB        NOT NULL,
-      updated_at TIMESTAMPTZ  DEFAULT NOW()
-    );
-  `);
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
@@ -85,94 +76,10 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// ── UPCOMING IDS — fetch from TMDB and cache ────────────────────
-// ✅ NEW: Hits TMDB /movie/upcoming pages 1–5, keeps only future-dated
-// movie IDs, and upserts into app_cache. Called on startup + daily cron.
-// Requires TMDB_KEY env var on Railway (same key used in the frontend).
-const refreshUpcomingIds = async () => {
-  const TMDB_KEY = process.env.TMDB_KEY;
-  if (!TMDB_KEY) {
-    console.warn("⚠  TMDB_KEY not set — skipping upcoming IDs refresh");
-    return null;
-  }
-  try {
-    const today  = new Date().toISOString().split("T")[0];
-    let   allIds = [];
-
-    for (let page = 1; page <= 5; page++) {
-      const url = new URL("https://api.themoviedb.org/3/movie/upcoming");
-      url.searchParams.set("api_key", TMDB_KEY);
-      url.searchParams.set("region",  "US");
-      url.searchParams.set("page",    page);
-
-      const res  = await fetch(url.toString());
-      if (!res.ok) break;
-
-      const data = await res.json();
-      const ids  = (data.results || [])
-        .filter(m => m.release_date && m.release_date > today)
-        .map(m => m.id);
-
-      allIds = [...allIds, ...ids];
-      if (page >= (data.total_pages || 1)) break;
-    }
-
-    const unique = [...new Set(allIds)];
-
-    await pool.query(
-      `INSERT INTO app_cache (key, value, updated_at)
-       VALUES ('upcoming_ids', $1, NOW())
-       ON CONFLICT (key) DO UPDATE
-         SET value = $1, updated_at = NOW()`,
-      [JSON.stringify(unique)]
-    );
-
-    console.log(`✓ upcoming_ids refreshed — ${unique.length} IDs`);
-    return unique;
-  } catch (err) {
-    console.error("upcoming_ids refresh failed:", err);
-    return null;
-  }
-};
-
-// Run 3s after startup (gives initDB time to finish), then daily at 03:00 UTC
-setTimeout(() => refreshUpcomingIds(), 3000);
-cron.schedule("0 3 * * *", () => {
-  console.log("⏰ Cron: refreshing upcoming IDs…");
-  refreshUpcomingIds();
-});
-
 // ── ROUTES ─────────────────────────────────────────────────────
 
 // Health check
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
-
-// ── GET /upcoming-ids ───────────────────────────────────────────
-// ✅ NEW: Public — no auth needed. Returns the cached upcoming movie IDs.
-// On a cold first boot (cache empty) it triggers a live fetch instead.
-app.get("/upcoming-ids", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT value, updated_at FROM app_cache WHERE key = 'upcoming_ids'"
-    );
-    if (!rows[0]) {
-      const ids = await refreshUpcomingIds();
-      return res.json({ ids: ids || [], updated_at: new Date() });
-    }
-    res.json({ ids: rows[0].value, updated_at: rows[0].updated_at });
-  } catch (err) {
-    console.error("upcoming-ids fetch error:", err);
-    res.status(500).json({ error: "Could not fetch upcoming IDs." });
-  }
-});
-
-// ── POST /upcoming-ids/refresh ──────────────────────────────────
-// ✅ NEW: Protected — manually trigger a refresh without waiting for cron.
-app.post("/upcoming-ids/refresh", authMiddleware, async (req, res) => {
-  const ids = await refreshUpcomingIds();
-  if (!ids) return res.status(500).json({ error: "Refresh failed. Check TMDB_KEY." });
-  res.json({ success: true, count: ids.length });
-});
 
 // ── POST /auth/register ─────────────────────────────────────────
 app.post("/auth/register", async (req, res) => {
