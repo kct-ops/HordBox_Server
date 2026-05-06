@@ -175,7 +175,7 @@ app.get("/user/data", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT watchlist_ids, watchlist, liked_ids, liked,
-              reminders, continue_watching
+              reminders, continue_watching, settings
        FROM users WHERE id = $1`,
       [req.userId]
     );
@@ -190,6 +190,7 @@ app.get("/user/data", authMiddleware, async (req, res) => {
         continue_watching: rows[0].continue_watching || {},
       },
       reminders: rows[0].reminders || {},
+      settings:  rows[0].settings  || {},
     });
   } catch (err) {
     console.error("Data fetch error:", err);
