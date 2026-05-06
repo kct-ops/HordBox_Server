@@ -8,7 +8,7 @@ const express    = require("express");
 const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
-const crypto     = require("crypto");           // built-in
+const crypto     = require("crypto");
 const { Pool }   = require("pg");
 
 const app  = express();
@@ -19,12 +19,12 @@ const pool = new Pool({
 
 // ── Middleware ──────────────────────────────────────────────────
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || "*",   // set your Vercel/Netlify URL
+  origin: process.env.ALLOWED_ORIGIN || "*",
   credentials: true,
 }));
 app.use(express.json());
 
-// ── DB Init — run once on startup ──────────────────────────────
+// ── DB Init ─────────────────────────────────────────────────────
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -42,26 +42,11 @@ const initDB = async () => {
       settings          JSONB        DEFAULT '{}'
     );
   `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';
-  `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';
-  `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';
-  `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN     DEFAULT FALSE;
-  `);
-  await pool.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS verification_token  VARCHAR(64) DEFAULT NULL;
-  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}';`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}';`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]';`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN     DEFAULT FALSE;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token  VARCHAR(64) DEFAULT NULL;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
       id         SERIAL PRIMARY KEY,
@@ -72,24 +57,23 @@ const initDB = async () => {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
   console.log("✓ DB ready");
 };
 initDB().catch(console.error);
 
-// ── Send password-reset email via Brevo ─────────────────────────
+// ── Send password-reset email via Resend ────────────────────────
 const sendResetEmail = async (to, username, resetUrl) => {
-  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+  const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'api-key': process.env.BREVO_API_KEY,
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: 'kctrical@gmail.com' },
-      to: [{ email: to }],
+      from: 'HordBox <onboarding@resend.dev>',
+      to: [to],
       subject: 'Reset your HordBox password',
-      htmlContent: `<!DOCTYPE html>
+      html: `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -128,26 +112,25 @@ const sendResetEmail = async (to, username, resetUrl) => {
 </html>`,
     }),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(JSON.stringify(err) || 'Brevo API error');
-  }
-  return res.json();
+  const body = await res.json();
+  console.log("Resend reset response:", res.status, JSON.stringify(body));
+  if (!res.ok) throw new Error(JSON.stringify(body));
+  return body;
 };
 
-// ── Send verification email via Brevo ───────────────────────────
+// ── Send verification email via Resend ──────────────────────────
 const sendVerificationEmail = async (to, username, verifyUrl) => {
-  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+  const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'api-key': process.env.BREVO_API_KEY,
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
     },
     body: JSON.stringify({
-      sender: { name: 'HordBox', email: 'kctrical@gmail.com' },
-      to: [{ email: to }],
+      from: 'HordBox <onboarding@resend.dev>',
+      to: [to],
       subject: 'Verify your HordBox email',
-      htmlContent: `<!DOCTYPE html>
+      html: `<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -186,10 +169,8 @@ const sendVerificationEmail = async (to, username, verifyUrl) => {
     }),
   });
   const body = await res.json();
-  console.log("Brevo verify response:", res.status, JSON.stringify(body));
-  if (!res.ok) {
-    throw new Error(JSON.stringify(body) || 'Brevo API error');
-  }
+  console.log("Resend verify response:", res.status, JSON.stringify(body));
+  if (!res.ok) throw new Error(JSON.stringify(body));
   return body;
 };
 
@@ -210,7 +191,7 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// ── ROUTES ─────────────────────────────────────────────────────
+// ── ROUTES ──────────────────────────────────────────────────────
 
 app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
