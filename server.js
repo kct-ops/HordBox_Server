@@ -9,7 +9,6 @@ const cors       = require("cors");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
 const crypto     = require("crypto");           // built-in
-const nodemailer = require("nodemailer");       // npm install nodemailer
 const { Pool }   = require("pg");
 
 const app  = express();
@@ -73,25 +72,63 @@ const initDB = async () => {
 };
 initDB().catch(console.error);
 
-// ── Nodemailer transporter (configured via env vars) ───────────
-// Required env vars on Railway:
-//   SMTP_HOST  — e.g. smtp.gmail.com
-//   SMTP_PORT  — e.g. 587
-//   SMTP_USER  — your email address
-//   SMTP_PASS  — app password (Gmail) or SMTP password
-//   SMTP_FROM  — "HordBox <noreply@yourdomain.com>"
-//   APP_URL    — your Vercel URL, e.g. https://hordbox.vercel.app
-const createTransporter = () =>
-  nodemailer.createTransport({
-    host:   process.env.SMTP_HOST,
-    port:   587,      // Railway blocks 465 — always use 587 (STARTTLS)
-    secure: false,    // false = STARTTLS upgrade after connection
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+// Send email via Resend HTTP API (avoids Railway SMTP port blocks)
+const sendResetEmail = async (to, username, resetUrl) => {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
     },
-    tls: { rejectUnauthorized: false },
+    body: JSON.stringify({
+      from: process.env.SMTP_FROM || 'HordBox <onboarding@resend.dev>',
+      to: [to],
+      subject: 'Reset your HordBox password',
+      html: `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#07090e;padding:40px 0;">
+    <tr><td align="center">
+      <table width="480" cellpadding="0" cellspacing="0"
+        style="background:#0d1119;border:1px solid #1e2736;border-radius:16px;padding:40px 36px;">
+        <tr><td>
+          <div style="font-size:22px;font-weight:900;color:#00c2d4;letter-spacing:2px;margin-bottom:28px;">
+            HORD<span style="color:#eef2f8;">BOX</span>
+          </div>
+          <h2 style="color:#eef2f8;font-size:20px;font-weight:800;margin:0 0 10px;">
+            Reset your password
+          </h2>
+          <p style="color:#8ca0b8;font-size:14px;line-height:1.6;margin:0 0 24px;">
+            Hi ${username}, we received a request to reset your password.
+            Click the button below to choose a new one.
+            This link expires in <strong style="color:#eef2f8;">1 hour</strong>.
+          </p>
+          <a href="${resetUrl}"
+            style="display:inline-block;background:#00c2d4;color:#07090e;font-weight:800;
+                   font-size:15px;padding:14px 32px;border-radius:10px;text-decoration:none;
+                   letter-spacing:0.3px;margin-bottom:24px;">
+            Set New Password
+          </a>
+          <p style="color:#4a5a6e;font-size:12px;line-height:1.6;margin:0;">
+            If you didn't request this, you can safely ignore this email.<br><br>
+            Or copy this link into your browser:<br>
+            <span style="color:#00c2d4;word-break:break-all;">${resetUrl}</span>
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`,
+    }),
   });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.message || 'Resend API error');
+  }
+  return res.json();
+};
 
 // ── JWT helpers ─────────────────────────────────────────────────
 const SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production";
@@ -244,51 +281,7 @@ app.post("/auth/forgot-password", async (req, res) => {
     const resetUrl = `${appUrl}?reset_token=${token}`;
     const username = rows[0].username;
 
-    const transporter = createTransporter();
-    await transporter.sendMail({
-      from:    process.env.SMTP_FROM || `"HordBox" <noreply@hordbox.app>`,
-      to:      email.trim(),
-      subject: "Reset your HordBox password",
-      html: `
-<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#07090e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#07090e;padding:40px 0;">
-    <tr><td align="center">
-      <table width="480" cellpadding="0" cellspacing="0"
-        style="background:#0d1119;border:1px solid #1e2736;border-radius:16px;padding:40px 36px;">
-        <tr><td>
-          <div style="font-size:22px;font-weight:900;color:#00c2d4;letter-spacing:2px;margin-bottom:28px;">
-            HORD<span style="color:#eef2f8;">BOX</span>
-          </div>
-          <h2 style="color:#eef2f8;font-size:20px;font-weight:800;margin:0 0 10px;">
-            Reset your password
-          </h2>
-          <p style="color:#8ca0b8;font-size:14px;line-height:1.6;margin:0 0 24px;">
-            Hi ${username}, we received a request to reset your password.
-            Click the button below to choose a new one.
-            This link expires in <strong style="color:#eef2f8;">1 hour</strong>.
-          </p>
-          <a href="${resetUrl}"
-            style="display:inline-block;background:#00c2d4;color:#07090e;font-weight:800;
-                   font-size:15px;padding:14px 32px;border-radius:10px;text-decoration:none;
-                   letter-spacing:0.3px;margin-bottom:24px;">
-            Set New Password
-          </a>
-          <p style="color:#4a5a6e;font-size:12px;line-height:1.6;margin:0;">
-            If you didn't request this, you can safely ignore this email —
-            your password won't change.<br><br>
-            Or copy this link into your browser:<br>
-            <span style="color:#00c2d4;word-break:break-all;">${resetUrl}</span>
-          </p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`,
-    });
+    await sendResetEmail(email.trim(), username, resetUrl);
 
     console.log(`✓ Password reset email sent to ${email.trim()}`);
   } catch (err) {
