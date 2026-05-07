@@ -107,10 +107,6 @@ const authMiddleware = (req, res, next) => {
 };
 
 // ── Helper: safely serialize a value for JSONB ──────────────────
-// Fixes the core data-loss bug: empty arrays [] and empty objects {}
-// are falsy in JS, so the old "value ? JSON.stringify(value) : null"
-// pattern sent null for empty collections, causing COALESCE to keep
-// stale data instead of saving the intended empty state.
 const toJson = (v) => (v !== undefined && v !== null ? JSON.stringify(v) : null);
 
 // ── ROUTES ─────────────────────────────────────────────────────
@@ -346,10 +342,6 @@ app.get("/user/data", authMiddleware, async (req, res) => {
 });
 
 // ── PUT /user/sync ──────────────────────────────────────────────
-// FIX: replaced "value ? JSON.stringify(value) : null" with toJson(value)
-// so that empty arrays [] and empty objects {} are saved correctly instead
-// of being treated as falsy and falling through to COALESCE's fallback,
-// which was silently keeping stale data on the backend.
 app.put("/user/sync", authMiddleware, async (req, res) => {
   const {
     watchlist_ids, watchlist_items, liked_ids, liked_items,
@@ -391,11 +383,28 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
 
 // ── DELETE /auth/account ────────────────────────────────────────
 app.delete("/auth/account", authMiddleware, async (req, res) => {
+  const { password } = req.body ?? {};
+
+  if (!password)
+    return res.status(400).json({ error: "Password is required to delete your account." });
+
   try {
+    const { rows } = await pool.query(
+      "SELECT password_hash FROM users WHERE id = $1",
+      [req.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "User not found." });
+
+    const valid = await bcrypt.compare(password, rows[0].password_hash);
+    if (!valid)
+      return res.status(401).json({ error: "Incorrect password. Please try again." });
+
     await pool.query("DELETE FROM users WHERE id = $1", [req.userId]);
     res.json({ success: true });
-  } catch {
-    res.status(500).json({ error: "Could not delete account." });
+
+  } catch (err) {
+    console.error("Delete account error:", err);
+    res.status(500).json({ error: "Could not delete account. Please try again." });
   }
 });
 
@@ -633,7 +642,6 @@ app.put("/auth/change-password", authMiddleware, async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Current password is incorrect." });
 
-    // ── FIX: block same password on the backend too ─────────────
     const same = await bcrypt.compare(new_password, rows[0].password_hash);
     if (same)
       return res.status(400).json({ error: "New password must be different from your current password." });
@@ -675,7 +683,6 @@ app.put("/auth/change-profile", authMiddleware, async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Password is incorrect." });
 
-    // ── FIX: block identical profile update on the backend too ──
     if (
       username.trim() === rows[0].username &&
       email.trim().toLowerCase() === rows[0].email
