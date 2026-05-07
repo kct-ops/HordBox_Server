@@ -27,30 +27,33 @@ app.use(express.json());
 const initDB = async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id                SERIAL PRIMARY KEY,
-      username          VARCHAR(50)  UNIQUE NOT NULL,
-      email             VARCHAR(255) UNIQUE NOT NULL,
-      password_hash     VARCHAR(255) NOT NULL,
-      created_at        TIMESTAMPTZ  DEFAULT NOW(),
-      avatar_char       VARCHAR(2)   DEFAULT '',
-      watchlist         JSONB        DEFAULT '[]',
-      watchlist_ids     JSONB        DEFAULT '[]',
-      liked             JSONB        DEFAULT '[]',
-      liked_ids         JSONB        DEFAULT '[]',
-      ratings           JSONB        DEFAULT '{}',
-      settings          JSONB        DEFAULT '{}'
+      id                    SERIAL PRIMARY KEY,
+      username              VARCHAR(50)  UNIQUE NOT NULL,
+      email                 VARCHAR(255) UNIQUE NOT NULL,
+      password_hash         VARCHAR(255) NOT NULL,
+      created_at            TIMESTAMPTZ  DEFAULT NOW(),
+      avatar_char           VARCHAR(2)   DEFAULT '',
+      watchlist             JSONB        DEFAULT '[]',
+      watchlist_ids         JSONB        DEFAULT '[]',
+      liked                 JSONB        DEFAULT '[]',
+      liked_ids             JSONB        DEFAULT '[]',
+      ratings               JSONB        DEFAULT '{}',
+      settings              JSONB        DEFAULT '{}'
     );
   `);
 
   // Safe incremental column additions
   const alterCols = [
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders         JSONB DEFAULT '{}'`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS continue_watching JSONB DEFAULT '{}'`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS search_history    JSONB DEFAULT '[]'`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_question VARCHAR(255) DEFAULT ''`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_answer_hash VARCHAR(255) DEFAULT ''`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS bio              TEXT DEFAULT ''`,
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_public        BOOLEAN DEFAULT TRUE`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders              JSONB   DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS continue_watching      JSONB   DEFAULT '{}'`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS search_history         JSONB   DEFAULT '[]'`,
+    // Dual security questions (new schema)
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_question_1       VARCHAR(255) DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_answer_hash_1    VARCHAR(255) DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_question_2       VARCHAR(255) DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_answer_hash_2    VARCHAR(255) DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS bio                    TEXT    DEFAULT ''`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_public              BOOLEAN DEFAULT TRUE`,
   ];
   for (const q of alterCols) await pool.query(q).catch(() => {});
 
@@ -78,12 +81,12 @@ const initDB = async () => {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_user ON activity(user_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_followers_follower ON followers(follower_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_user      ON activity(user_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_created   ON activity(created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_followers_follower  ON followers(follower_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_followers_following ON followers(following_id);`);
 
-  console.log("✓ DB ready (incl. social tables)");
+  console.log("✓ DB ready (incl. social tables + dual security questions)");
 };
 initDB().catch(console.error);
 
@@ -111,8 +114,17 @@ app.get("/", (req, res) => res.json({ status: "HordBox API running" }));
 
 // ── POST /auth/register ─────────────────────────────────────────
 app.post("/auth/register", async (req, res) => {
-  const { username, email, password, security_question, security_answer } = req.body ?? {};
+  const {
+    username,
+    email,
+    password,
+    security_question_1,
+    security_answer_1,
+    security_question_2,
+    security_answer_2,
+  } = req.body ?? {};
 
+  // ── Basic field validation ──────────────────────────────────
   if (!username?.trim() || !email?.trim() || !password)
     return res.status(400).json({ error: "username, email and password are required." });
 
@@ -125,26 +137,44 @@ app.post("/auth/register", async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: "Please enter a valid email address." });
 
-  if (!security_question?.trim() || !security_answer?.trim())
+  // ── Dual security question validation ──────────────────────
+  if (!security_question_1?.trim() || !security_answer_1?.trim())
     return res.status(400).json({ error: "Please choose a security question and provide an answer." });
 
-  if (security_answer.trim().length < 2)
-    return res.status(400).json({ error: "Security answer must be at least 2 characters." });
+  if (security_answer_1.trim().length < 2)
+    return res.status(400).json({ error: "Security answer 1 must be at least 2 characters." });
+
+  if (!security_question_2?.trim() || !security_answer_2?.trim())
+    return res.status(400).json({ error: "Please choose a second security question and provide an answer." });
+
+  if (security_answer_2.trim().length < 2)
+    return res.status(400).json({ error: "Security answer 2 must be at least 2 characters." });
+
+  if (security_question_1.trim() === security_question_2.trim())
+    return res.status(400).json({ error: "Please choose two different security questions." });
 
   try {
-    const hash       = await bcrypt.hash(password, 12);
-    const answerHash = await bcrypt.hash(security_answer.trim().toLowerCase(), 12);
+    const hash        = await bcrypt.hash(password, 12);
+    const answerHash1 = await bcrypt.hash(security_answer_1.trim().toLowerCase(), 12);
+    const answerHash2 = await bcrypt.hash(security_answer_2.trim().toLowerCase(), 12);
+
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, avatar_char, security_question, security_answer_hash)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO users (
+         username, email, password_hash, avatar_char,
+         security_question_1, security_answer_hash_1,
+         security_question_2, security_answer_hash_2
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id, username, email, created_at`,
       [
         username.trim(),
         email.toLowerCase().trim(),
         hash,
         username.trim()[0].toUpperCase(),
-        security_question.trim(),
-        answerHash,
+        security_question_1.trim(),
+        answerHash1,
+        security_question_2.trim(),
+        answerHash2,
       ]
     );
 
@@ -212,6 +242,7 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 });
 
 // ── POST /auth/get-security-question ────────────────────────────
+// Returns both security questions for the forgot-password flow.
 app.post("/auth/get-security-question", async (req, res) => {
   const { email } = req.body ?? {};
   if (!email?.trim())
@@ -219,13 +250,17 @@ app.post("/auth/get-security-question", async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      "SELECT security_question FROM users WHERE email = $1",
+      "SELECT security_question_1, security_question_2 FROM users WHERE email = $1",
       [email.toLowerCase().trim()]
     );
-    if (!rows[0] || !rows[0].security_question)
+
+    if (!rows[0] || (!rows[0].security_question_1 && !rows[0].security_question_2))
       return res.status(404).json({ error: "No account found with that email address." });
 
-    res.json({ question: rows[0].security_question });
+    res.json({
+      question_1: rows[0].security_question_1 || "",
+      question_2: rows[0].security_question_2 || "",
+    });
   } catch (err) {
     console.error("Get security question error:", err);
     res.status(500).json({ error: "Something went wrong. Please try again." });
@@ -233,29 +268,38 @@ app.post("/auth/get-security-question", async (req, res) => {
 });
 
 // ── POST /auth/reset-password ────────────────────────────────────
+// Verifies both security answers before allowing a password reset.
 app.post("/auth/reset-password", async (req, res) => {
-  const { email, security_answer, new_password } = req.body ?? {};
+  const { email, security_answer_1, security_answer_2, new_password } = req.body ?? {};
 
-  if (!email?.trim() || !security_answer?.trim() || !new_password)
-    return res.status(400).json({ error: "Email, security answer, and new password are required." });
+  if (!email?.trim() || !security_answer_1?.trim() || !security_answer_2?.trim() || !new_password)
+    return res.status(400).json({ error: "Email, both security answers, and a new password are required." });
 
   if (new_password.length < 8)
     return res.status(400).json({ error: "Password must be at least 8 characters." });
 
   try {
     const { rows } = await pool.query(
-      "SELECT id, security_answer_hash FROM users WHERE email = $1",
+      "SELECT id, security_answer_hash_1, security_answer_hash_2 FROM users WHERE email = $1",
       [email.toLowerCase().trim()]
     );
+
     if (!rows[0])
       return res.status(404).json({ error: "No account found with that email address." });
 
-    const valid = await bcrypt.compare(
-      security_answer.trim().toLowerCase(),
-      rows[0].security_answer_hash
+    const valid1 = await bcrypt.compare(
+      security_answer_1.trim().toLowerCase(),
+      rows[0].security_answer_hash_1
     );
-    if (!valid)
-      return res.status(401).json({ error: "Incorrect answer. Please try again." });
+    if (!valid1)
+      return res.status(401).json({ error: "Incorrect answer to question 1. Please try again." });
+
+    const valid2 = await bcrypt.compare(
+      security_answer_2.trim().toLowerCase(),
+      rows[0].security_answer_hash_2
+    );
+    if (!valid2)
+      return res.status(401).json({ error: "Incorrect answer to question 2. Please try again." });
 
     const hash = await bcrypt.hash(new_password, 12);
     await pool.query(
@@ -354,7 +398,6 @@ app.delete("/auth/account", authMiddleware, async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 
 // ── GET /users/search?q=username ────────────────────────────────
-// Find users by username (partial match, public search)
 app.get("/users/search", authMiddleware, async (req, res) => {
   const q = (req.query.q || "").trim();
   if (q.length < 2)
@@ -378,10 +421,8 @@ app.get("/users/search", authMiddleware, async (req, res) => {
 });
 
 // ── GET /users/:username ─────────────────────────────────────────
-// Public profile for any user
 app.get("/users/:username", async (req, res) => {
   const { username } = req.params;
-  // Peek at auth token if present (optional — needed for you_follow flag)
   let viewerId = null;
   try {
     const token = req.headers.authorization?.split(" ")[1];
@@ -422,7 +463,6 @@ app.post("/social/follow/:userId", authMiddleware, async (req, res) => {
       "INSERT INTO followers (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
       [req.userId, followingId]
     );
-    // Log activity for the person being followed (optional notification hook)
     res.json({ success: true, action: "followed" });
   } catch (err) {
     console.error("Follow error:", err);
@@ -449,7 +489,6 @@ app.delete("/social/follow/:userId", authMiddleware, async (req, res) => {
 });
 
 // ── GET /social/status/:userId ───────────────────────────────────
-// Check if the logged-in user follows a specific user
 app.get("/social/status/:userId", authMiddleware, async (req, res) => {
   const targetId = parseInt(req.params.userId);
   try {
@@ -464,7 +503,6 @@ app.get("/social/status/:userId", authMiddleware, async (req, res) => {
 });
 
 // ── GET /social/followers ────────────────────────────────────────
-// Your followers list
 app.get("/social/followers", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -484,7 +522,6 @@ app.get("/social/followers", authMiddleware, async (req, res) => {
 });
 
 // ── GET /social/following ────────────────────────────────────────
-// Who you follow
 app.get("/social/following", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -503,7 +540,6 @@ app.get("/social/following", authMiddleware, async (req, res) => {
 });
 
 // ── GET /social/feed ─────────────────────────────────────────────
-// Activity from people you follow
 app.get("/social/feed", authMiddleware, async (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit  || "50"), 100);
   const offset = parseInt(req.query.offset || "0");
@@ -530,7 +566,6 @@ app.get("/social/feed", authMiddleware, async (req, res) => {
 });
 
 // ── POST /social/activity ────────────────────────────────────────
-// Log a user action (liked, watchlisted, rated, watched)
 app.post("/social/activity", authMiddleware, async (req, res) => {
   const { type, item_id, item_title, item_poster, media_type, rating } = req.body ?? {};
 
@@ -539,10 +574,8 @@ app.post("/social/activity", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Invalid activity type." });
 
   try {
-    // Avoid flooding — don't log "unliked"/"removed_watchlist" as positive activities
     const positiveTypes = ["liked", "watchlisted", "rated", "watched"];
     if (!positiveTypes.includes(type)) {
-      // Just delete the corresponding activity to keep feed clean
       if (item_id) {
         const reverseType = type === "unliked" ? "liked" : "watchlisted";
         await pool.query(
@@ -553,7 +586,6 @@ app.post("/social/activity", authMiddleware, async (req, res) => {
       return res.json({ success: true });
     }
 
-    // Upsert — don't create duplicate rows for the same (user, type, item)
     await pool.query(
       `INSERT INTO activity (user_id, type, item_id, item_title, item_poster, media_type, rating)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -567,8 +599,7 @@ app.post("/social/activity", authMiddleware, async (req, res) => {
   }
 });
 
-// Add a unique constraint to prevent exact duplicate activity rows
-// (This runs silently — if it already exists it's a no-op)
+// Deduplicate activity rows
 pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_dedup
   ON activity (user_id, type, item_id)
