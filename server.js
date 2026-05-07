@@ -47,7 +47,6 @@ const initDB = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS reminders              JSONB   DEFAULT '{}'`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS continue_watching      JSONB   DEFAULT '{}'`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS search_history         JSONB   DEFAULT '[]'`,
-    // Dual security questions (new schema)
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_question_1       VARCHAR(255) DEFAULT ''`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_answer_hash_1    VARCHAR(255) DEFAULT ''`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS security_question_2       VARCHAR(255) DEFAULT ''`,
@@ -107,6 +106,13 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
+// ── Helper: safely serialize a value for JSONB ──────────────────
+// Fixes the core data-loss bug: empty arrays [] and empty objects {}
+// are falsy in JS, so the old "value ? JSON.stringify(value) : null"
+// pattern sent null for empty collections, causing COALESCE to keep
+// stale data instead of saving the intended empty state.
+const toJson = (v) => (v !== undefined && v !== null ? JSON.stringify(v) : null);
+
 // ── ROUTES ─────────────────────────────────────────────────────
 
 // Health check
@@ -124,7 +130,6 @@ app.post("/auth/register", async (req, res) => {
     security_answer_2,
   } = req.body ?? {};
 
-  // ── Basic field validation ──────────────────────────────────
   if (!username?.trim() || !email?.trim() || !password)
     return res.status(400).json({ error: "username, email and password are required." });
 
@@ -137,7 +142,6 @@ app.post("/auth/register", async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
     return res.status(400).json({ error: "Please enter a valid email address." });
 
-  // ── Dual security question validation ──────────────────────
   if (!security_question_1?.trim() || !security_answer_1?.trim())
     return res.status(400).json({ error: "Please choose a security question and provide an answer." });
 
@@ -242,7 +246,6 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 });
 
 // ── POST /auth/get-security-question ────────────────────────────
-// Returns both security questions for the forgot-password flow.
 app.post("/auth/get-security-question", async (req, res) => {
   const { email } = req.body ?? {};
   if (!email?.trim())
@@ -268,7 +271,6 @@ app.post("/auth/get-security-question", async (req, res) => {
 });
 
 // ── POST /auth/reset-password ────────────────────────────────────
-// Verifies both security answers before allowing a password reset.
 app.post("/auth/reset-password", async (req, res) => {
   const { email, security_answer_1, security_answer_2, new_password } = req.body ?? {};
 
@@ -344,6 +346,10 @@ app.get("/user/data", authMiddleware, async (req, res) => {
 });
 
 // ── PUT /user/sync ──────────────────────────────────────────────
+// FIX: replaced "value ? JSON.stringify(value) : null" with toJson(value)
+// so that empty arrays [] and empty objects {} are saved correctly instead
+// of being treated as falsy and falling through to COALESCE's fallback,
+// which was silently keeping stale data on the backend.
 app.put("/user/sync", authMiddleware, async (req, res) => {
   const {
     watchlist_ids, watchlist_items, liked_ids, liked_items,
@@ -353,26 +359,26 @@ app.put("/user/sync", authMiddleware, async (req, res) => {
   try {
     await pool.query(
       `UPDATE users
-       SET watchlist_ids     = COALESCE($1,  watchlist_ids),
-           watchlist         = COALESCE($2,  watchlist),
-           liked_ids         = COALESCE($3,  liked_ids),
-           liked             = COALESCE($4,  liked),
-           reminders         = COALESCE($5,  reminders),
-           ratings           = COALESCE($6,  ratings),
-           settings          = COALESCE($7,  settings),
-           continue_watching = COALESCE($8,  continue_watching),
-           search_history    = COALESCE($9,  search_history)
+       SET watchlist_ids     = COALESCE($1::jsonb,  watchlist_ids),
+           watchlist         = COALESCE($2::jsonb,  watchlist),
+           liked_ids         = COALESCE($3::jsonb,  liked_ids),
+           liked             = COALESCE($4::jsonb,  liked),
+           reminders         = COALESCE($5::jsonb,  reminders),
+           ratings           = COALESCE($6::jsonb,  ratings),
+           settings          = COALESCE($7::jsonb,  settings),
+           continue_watching = COALESCE($8::jsonb,  continue_watching),
+           search_history    = COALESCE($9::jsonb,  search_history)
        WHERE id = $10`,
       [
-        watchlist_ids     ? JSON.stringify(watchlist_ids)     : null,
-        watchlist_items   ? JSON.stringify(watchlist_items)   : null,
-        liked_ids         ? JSON.stringify(liked_ids)         : null,
-        liked_items       ? JSON.stringify(liked_items)       : null,
-        reminders         ? JSON.stringify(reminders)         : null,
-        ratings           ? JSON.stringify(ratings)           : null,
-        settings          ? JSON.stringify(settings)          : null,
-        continue_watching ? JSON.stringify(continue_watching) : null,
-        search_history    ? JSON.stringify(search_history)    : null,
+        toJson(watchlist_ids),
+        toJson(watchlist_items),
+        toJson(liked_ids),
+        toJson(liked_items),
+        toJson(reminders),
+        toJson(ratings),
+        toJson(settings),
+        toJson(continue_watching),
+        toJson(search_history),
         req.userId,
       ]
     );
@@ -394,7 +400,7 @@ app.delete("/auth/account", authMiddleware, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// STAGE 4 — SOCIAL ROUTES
+// SOCIAL ROUTES
 // ════════════════════════════════════════════════════════════════
 
 // ── GET /users/search?q=username ────────────────────────────────
@@ -627,6 +633,11 @@ app.put("/auth/change-password", authMiddleware, async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: "Current password is incorrect." });
 
+    // ── FIX: block same password on the backend too ─────────────
+    const same = await bcrypt.compare(new_password, rows[0].password_hash);
+    if (same)
+      return res.status(400).json({ error: "New password must be different from your current password." });
+
     const hash = await bcrypt.hash(new_password, 12);
     await pool.query(
       "UPDATE users SET password_hash = $1 WHERE id = $2",
@@ -655,7 +666,7 @@ app.put("/auth/change-profile", authMiddleware, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      "SELECT password_hash FROM users WHERE id = $1",
+      "SELECT username, email, password_hash FROM users WHERE id = $1",
       [req.userId]
     );
     if (!rows[0]) return res.status(404).json({ error: "User not found." });
@@ -663,6 +674,14 @@ app.put("/auth/change-profile", authMiddleware, async (req, res) => {
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid)
       return res.status(401).json({ error: "Password is incorrect." });
+
+    // ── FIX: block identical profile update on the backend too ──
+    if (
+      username.trim() === rows[0].username &&
+      email.trim().toLowerCase() === rows[0].email
+    ) {
+      return res.status(400).json({ error: "No changes detected. Please update your username or email before saving." });
+    }
 
     const { rows: updated } = await pool.query(
       `UPDATE users
@@ -686,7 +705,6 @@ app.put("/auth/change-profile", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Failed to update profile." });
   }
 });
-
 
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
