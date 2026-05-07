@@ -606,6 +606,88 @@ pool.query(`
   WHERE item_id IS NOT NULL
 `).catch(() => {});
 
+// ── PUT /auth/change-password ───────────────────────────────────
+app.put("/auth/change-password", authMiddleware, async (req, res) => {
+  const { current_password, new_password } = req.body ?? {};
+
+  if (!current_password || !new_password)
+    return res.status(400).json({ error: "Current and new password are required." });
+
+  if (new_password.length < 8)
+    return res.status(400).json({ error: "New password must be at least 8 characters." });
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT password_hash FROM users WHERE id = $1",
+      [req.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "User not found." });
+
+    const valid = await bcrypt.compare(current_password, rows[0].password_hash);
+    if (!valid)
+      return res.status(401).json({ error: "Current password is incorrect." });
+
+    const hash = await bcrypt.hash(new_password, 12);
+    await pool.query(
+      "UPDATE users SET password_hash = $1 WHERE id = $2",
+      [hash, req.userId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Change password error:", err);
+    res.status(500).json({ error: "Failed to change password." });
+  }
+});
+
+// ── PUT /auth/change-profile ────────────────────────────────────
+app.put("/auth/change-profile", authMiddleware, async (req, res) => {
+  const { username, email, password } = req.body ?? {};
+
+  if (!username?.trim() || username.trim().length < 3)
+    return res.status(400).json({ error: "Username must be at least 3 characters." });
+
+  if (!email?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))
+    return res.status(400).json({ error: "Please enter a valid email address." });
+
+  if (!password)
+    return res.status(400).json({ error: "Current password is required to confirm changes." });
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT password_hash FROM users WHERE id = $1",
+      [req.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "User not found." });
+
+    const valid = await bcrypt.compare(password, rows[0].password_hash);
+    if (!valid)
+      return res.status(401).json({ error: "Password is incorrect." });
+
+    const { rows: updated } = await pool.query(
+      `UPDATE users
+       SET username = $1, email = $2
+       WHERE id = $3
+       RETURNING id, username, email`,
+      [username.trim(), email.trim().toLowerCase(), req.userId]
+    );
+
+    res.json({ success: true, user: updated[0] });
+  } catch (err) {
+    if (err.code === "23505") {
+      const field = err.detail?.includes("email") ? "email" : "username";
+      return res.status(409).json({
+        error: field === "email"
+          ? "That email is already in use."
+          : "That username is already taken.",
+      });
+    }
+    console.error("Change profile error:", err);
+    res.status(500).json({ error: "Failed to update profile." });
+  }
+});
+
+
 // ── Start ───────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
